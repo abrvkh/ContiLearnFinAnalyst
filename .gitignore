@@ -1,6 +1,7 @@
 # Data and generated artifacts
-data/
+/data/
 predictions/
+.tmp/
 
 # Python environment and build outputs
 .venv/

@@ -1,0 +1,26 @@
+[project]
+name = "contilearn-fin-analyst"
+version = "0.1.0"
+description = "Simple SEC 10-K, returns, LLM strategy, and PnL workflow."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "chromadb>=1.5.9",
+    "huggingface_hub>=0.34.0",
+    "matplotlib>=3.8.0",
+    "openai>=1.100.0",
+    "onnxruntime==1.22.1",
+    "pandas>=2.2.0",
+    "pyarrow>=17.0.0",
+    "tqdm>=4.66.0",
+    "transformers>=4.55.0",
+    "vllm>=0.10.2",
+    "yfinance>=0.2.65",
+    "packaging>=26.3",
+    "psutil>=7.2.2",
+    "ninja>=1.13.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

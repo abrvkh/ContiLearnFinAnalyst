@@ -1,0 +1,32 @@
+# Data and generated artifacts
+data/
+predictions/
+
+# Python environment and build outputs
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Tool caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/

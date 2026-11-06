@@ -57,7 +57,7 @@ uv pip install -e .
 
 ### OpenAI
 
-If you use `strategies/baseline.py` with `--provider openai`, set:
+If you use `src/strategies/baseline.py` with `--provider openai`, set:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
@@ -69,7 +69,7 @@ The baseline strategy uses the official OpenAI Python SDK.
 
 For `src/data/build_10k_hf.py`, public dataset download typically works without a token.
 
-For `strategies/baseline.py` with `--provider hf`, public models can often be used without a token, but for gated models or higher rate limits you may need:
+For `src/strategies/baseline.py` with `--provider hf`, public models can often be used without a token, but for gated models or higher rate limits you may need:
 
 ```bash
 export HF_TOKEN=your_token_here
@@ -135,12 +135,53 @@ This writes:
 
 - `data/financial-reports-sec/market_data/returns_demeaned.parquet`
 
-### 5. Run the baseline LLM strategy
+### 5. Generate and clean risk summaries
+
+Cleaning is critical: the strategy workflow is intended to run on
+`summaries.filtered.parquet`, not directly on noisy raw filings.
+
+Generate summaries:
+
+```bash
+uv run python src/data/summarize_risk_sections.py \
+  --mode generate \
+  --provider hf \
+  --model Qwen/Qwen3-8B \
+  --resume
+```
+
+This creates or updates `data/financial-reports-sec/summary/summaries.parquet`
+and sharded JSONL checkpoints. Then clean/filter them:
+
+```bash
+uv run python src/data/summarize_risk_sections.py \
+  --mode clean \
+  --provider hf \
+  --model Qwen/Qwen3-8B \
+  --batch-size 16 \
+  --resume
+```
+
+This writes `summaries.review.parquet`, `summaries.filtered.parquet` (the
+strategy input), and `summaries.rejected.parquet`.
+
+### 6. Run the baseline LLM strategy
+
+`src/strategies/baseline.py` is a fixed-prompt workflow: for each filing,
+the model receives either the current risk summary alone or the current and
+previous-year summaries, then returns `NEW` or `NO_NEW`. Those labels are
+converted directly to `-1` or `1`. 
+
+The stored baseline variants are:
+
+- `baseline_no_past_context`: current filing only.
+- `baseline_with_past_context`: current filing plus the previous-year filing,
+  enabled by `--use-past-context`.
 
 OpenAI:
 
 ```bash
-OPENAI_API_KEY=... uv run python strategies/baseline.py \
+OPENAI_API_KEY=... uv run python src/strategies/baseline.py \
   --provider openai \
   --model gpt-4.1-mini
 ```
@@ -148,7 +189,7 @@ OPENAI_API_KEY=... uv run python strategies/baseline.py \
 Hugging Face:
 
 ```bash
-uv run python strategies/baseline.py \
+uv run python src/strategies/baseline.py \
   --provider hf \
   --model google/gemma-2-2b-it
 ```
@@ -173,25 +214,72 @@ Predictions are stored as a wide parquet panel:
 - columns: Yahoo tickers
 - values: `-1` or `1`
 
-### 6. Estimate LLM cost
+### 7. Run one strategy-agent strategy
 
-Use built-in OpenAI pricing snapshot:
+`src/strategy_agent/run_strategy_agent.py` is the structured strategy layer.
+Unlike the fixed baseline, it expects a strategy JSON defining the hypothesis,
+analysis steps, labels, and prediction rule.
 
-```bash
-uv run python strategies/util.py --model gpt-5.6-terra
+For example:
+
+```json
+{
+  "system_prompt": "You are a financial analyst.",
+  "hypothesis": "New company-specific risks may predict downside.",
+  "steps": [{
+    "stocks": ["TARGET_STOCK"],
+    "years": ["TARGET_YEAR", "TARGET_YEAR-1"],
+    "question": "Did the current filing introduce a material new risk?",
+    "output_labels": ["YES", "NO", "UNCLEAR"],
+    "label_descriptions": {
+      "YES": "A material new risk is explicitly present.",
+      "NO": "No material new risk is identified.",
+      "UNCLEAR": "The summaries are insufficient to decide."
+    }
+  }],
+  "prediction_rule": {
+    "instructions": "DOWN for YES, UP for NO, otherwise abstain.",
+    "output_labels": ["DOWN", "UP", "NO_POSITION"],
+    "parse_map": {"DOWN": -1, "UP": 1, "NO_POSITION": 0}
+  }
+}
 ```
 
-Use your own prices:
+`stocks` may contain `TARGET_STOCK` and/or `SECTOR_PEERS`; years may be
+`TARGET_YEAR`, `TARGET_YEAR-N`, or a literal year. Every label needs a
+description and a prediction label needs a `parse_map` value of `-1`, `0`, `1`,
+or `null`.
+
+Run it with:
 
 ```bash
-uv run python strategies/util.py \
-  --input-cost-per-1m 2.0 \
-  --output-cost-per-1m 12.0
+uv run python src/strategy_agent/run_strategy_agent.py \
+  --provider openai \
+  --model gpt-4.1-mini \
+  --predictions-dir predictions/my_strategy \
+  --run-name my_strategy \
+  --strategy-path predictions/my_strategy/strategy.json \
+  --summaries-path data/financial-reports-sec/summary/summaries.filtered.parquet \
+  --sector-map-path data/financial-reports-sec/market_data/sector_companies.json
 ```
 
-By default this uses both `train` and `test` and counts one example per ticker-filing pair with a `section_1A` risk section.
+With a local vLLM model:
 
-### 7. Evaluate PnL
+```bash
+uv run python src/strategy_agent/run_strategy_agent.py \
+  --provider vllm \
+  --model Qwen/Qwen3-8B \
+  --predictions-dir predictions/my_strategy_vllm \
+  --run-name my_strategy_vllm \
+  --strategy-path predictions/my_strategy/strategy.json \
+  --summaries-path data/financial-reports-sec/summary/summaries.filtered.parquet \
+  --sector-map-path data/financial-reports-sec/market_data/sector_companies.json
+```
+
+This writes the prediction panel, row-level predictions, model logs, and
+metrics. The `agent_*` runs use this path; they are not baseline runs.
+
+### 8. Evaluate PnL
 
 ```bash
 uv run python src/eval/run_10k_pnl.py --run-name baseline_strategy
@@ -202,158 +290,138 @@ This:
 - loads `predictions/baseline_strategy/baseline_strategy.parquet`
 - loads `data/financial-reports-sec/market_data/return.parquet`
 - aligns dates and tickers
-- computes `pred.shift(2).mul(ret).sum(axis=1)`
+- computes `predictions.shift(2).mul(returns).sum(axis=1)`
 - prints the annualized Sharpe
 - saves a plot next to the prediction file
 
-### Baseline Notes
+The main evaluation options are:
 
-The current workable baseline setup is:
+- No forward-fill: only the filing-date signal is held.
+- `--ffill-limit 30`: hold a signal for up to 30 trading days.
+- `--ffill-limit 252`: hold it for up to roughly one trading year.
+- `--postprocess cross-sectional-rank`: demean and scale signals across all
+  tickers on each date.
+- `--use-sectors` with cross-sectional ranking: perform that normalization
+  within sectors using `sector_companies.json`; without it, ranking is across
+  the whole universe.
+- `--postprocess normalize-predictor`: apply each ticker's causal rolling
+  252-day volatility normalization and clip the result.
 
-- Generate risk-section summaries
-- Clean them into `data/financial-reports-sec/summary/summaries.filtered.parquet`
-- Run `src/strategies/baseline.py` against the filtered summaries instead of raw `section_1A` text
-- Evaluate with forward-filled predictions, cross-sectional ranking, and clipped returns
-
-This is not presented as a final research conclusion, but it is a reasonable current pipeline for quick iteration because:
-
-- the filtered summary file is much smaller and cleaner than the raw summary set
-- the baseline strategy is easier to run on summaries than on full risk-section text
-- clipping returns reduces the impact of obvious return outliers in the market data
-- cross-sectional ranking with forward fill gives a more usable daily signal than same-day filing events alone
-
-Two evaluation configurations that currently produce nontrivial results are:
+These options can materially change the signal and Sharpe, so record the exact
+command with every metric. For example, a 30-day forward-filled evaluation is:
 
 ```bash
 uv run python src/eval/run_10k_pnl.py \
-  --run-name baseline_strategy \
-  --ffill-limit 30 \
+  --run-name agent_single_risk_assessment \
+  --predictions-dir predictions/agent_single_risk_assessment \
+  --ffill-limit 30
 ```
 
-Observed annualized Sharpe on the current local run: about `0.669`.
-
-This is the simplest decent baseline in the current setup because it uses only forward-filled filing signals without adding cross-sectional or sector-relative transformations.
-
-With per-date z-scoring (signal - cross_sectional_mean) / cross_sectional_std: 
+Add cross-sectional normalization, without a sector file:
 ```bash
 uv run python src/eval/run_10k_pnl.py \
-  --run-name baseline_strategy \
+  --run-name agent_single_risk_assessment \
+  --predictions-dir predictions/agent_single_risk_assessment \
   --ffill-limit 30 \
   --postprocess cross-sectional-rank \
   --postprocess normalize-predictor
 ```
-gets an annualized Sharpe on the current local run: about `0.663`.
+Some example runs to give a sense of the performance: 
 
-With per-date, over sector only z-scoring gets: 
+| Run/configuration | Sharpe | t-stat | Always-long correlation |
+|---|---:|---:|---:|
+| `agent_single_risk_assessment`, ffill 30 | -0.251 | -1.319 | -0.030 |
+| Same, ffill 252 | -0.704 | -3.703 | 0.041 |
+| Same + cross-sectional, ffill 30 | -0.418 | -2.198 | -0.047 |
+| Same + cross-sectional, ffill 252 | -1.045 | -5.501 | 0.000 |
+| `agent_compare_two_years`, ffill 30 | -0.331 | -1.744 | -0.498 |
+| Same + cross-sectional, ffill 30 | 0.152 | 0.801 | -0.053 |
+| Same, ffill 252 | -1.162 | -6.116 | -0.833 |
+| Same + cross-sectional, ffill 252 | 0.571 | 3.006 | -0.031 |
+| `baseline_no_past_context` | 1.472 | 7.744 | 0.797 |
+| `baseline_with_past_context` | 0.398 | 2.094 | 0.000 |
+
+### 9. Propose and iterate strategies
+
+`propose_strategy.py` generates an initial strategy, runs it, inspects its
+performance, and optionally generates replacements. Each iteration is stored
+under the predictions directory.
+
 ```bash
-uv run python src/eval/run_10k_pnl.py \
-  --run-name baseline_strategy \
-  --ffill-limit 252 \
-  --postprocess cross-sectional-rank \
-  --use-sectors \
-  --postprocess normalize-predictor
+OPENAI_API_KEY=... uv run python src/strategy_agent/propose_strategy.py \
+  --provider openai \
+  --model gpt-4.1-mini \
+  --predictions-dir predictions/openai_luna_new \
+  --run-name openai_luna_new \
+  --max-iterations 10
 ```
-gets an annualized Sharpe on the current local run: about `1.16`.
 
-When reproducing these results, make sure the predictions were generated from `summaries.filtered.parquet`, not from the raw filings directly.
-
-### 8. Generate and clean risk summaries
-
-Generate summaries:
+With a local vLLM model:
 
 ```bash
-uv run python src/data/summarize_risk_sections.py \
-  --mode generate \
-  --provider hf \
+uv run python src/strategy_agent/propose_strategy.py \
+  --provider vllm \
   --model Qwen/Qwen3-8B \
-  --resume
+  --predictions-dir predictions/qwen3_proposals \
+  --run-name qwen3_proposals \
+  --max-iterations 10
 ```
 
-`--mode generate` writes or updates:
+The generated strategy is in `iteration_000/strategy.json`; later iterations
+contain replacements selected after diagnostic inspections. The complete
+proposal history is in `proposal_trajectory.jsonl`. Use
+`src/strategy_agent/overview.md` for a shorter proposal-loop reference.
 
-- Appends checkpoint rows to sharded JSONL files under `data/financial-reports-sec/summary/<split>/<shard>.jsonl`
-- Rebuilds and overwrites `data/financial-reports-sec/summary/summaries.parquet` from those JSONL shards
-- Does not write `summaries.review.parquet`, `summaries.filtered.parquet`, or `summaries.rejected.parquet`
+The proposal loop works as follows:
 
-Clean or filter existing summaries:
+1. Two variants of an initial prompt that instructs the model to generate a hypothesis: i) `initial_prompt` discovers the two seed strategies and records their primary metrics in
+   `proposal_trajectory.jsonl` as initial context, ii) 
+   `initial_prompt_v2` does not pass those examples into the model prompt; it
+   starts from its standalone hypothesis ideas. 
+2. The model proposes an initial strategy JSON.
+3. The loop runs that strategy through `run_strategy_agent.py` and evaluates
+   the resulting predictions.
+4. After each iteration, the model chooses one action:
+   - `inspect_general_performance`: inspect aggregate error rate, UP-rate bias,
+     and Sharpe.
+   - `inspect_per_year`: inspect the same diagnostics for one filing year.
+   - `inspect_per_sector`: inspect the diagnostics for one sector.
+   - `propose_strategy`: replace the current strategy using the diagnostics.
+   - `stop`: finish and keep the latest strategy.
+   In principle, you can extend this into something stronger. 
+5. The loop repeats until the requested iteration count is reached or the
+   model chooses `stop`. It allows at most 10 inspection actions between
+   strategy proposals.
 
-```bash
-uv run python src/data/summarize_risk_sections.py \
-  --mode clean \
-  --provider hf \
-  --model Qwen/Qwen3-8B \
-  --batch-size 16 \
-  --resume
+The inspection tools use the saved final prediction logs and realized returns;
+they do not perform new web searches. Each iteration directory contains the
+strategy, predictions, logs, plots, and metrics. `proposal_trajectory.jsonl`
+records the initial proposal, model action responses, inspections, accepted
+replacements, and stop events, which makes the proposal process auditable.
+
+The decision prompt expects one JSON action, for example:
+
+```json
+{"action": "inspect_per_year", "target_year": 2020}
 ```
 
-`--mode clean` reads `data/financial-reports-sec/summary/summaries.parquet` and writes:
+Inspection results are fed back into the next decision prompt. A replacement
+strategy is accepted only after it passes `StrategySpec` validation.
 
-- Overwrites `data/financial-reports-sec/summary/summaries.review.parquet`
-- Overwrites `data/financial-reports-sec/summary/summaries.filtered.parquet`
-- Overwrites `data/financial-reports-sec/summary/summaries.rejected.parquet`
-- Does not modify the sharded JSONL checkpoints
-- Does not modify `data/financial-reports-sec/summary/summaries.parquet`
+This is separate from `contilearn/simple_reflection`. The proposal agent has
+its own performance-inspection actions and does not call the experimental
+reflector. The simple-reflection workflow independently asks a model to inspect
+logs and reflect on a strategy; it is not part of the normal proposal command.
 
-### 9. Build the retrieval index
+The proposal agent does not introduce another prediction format. It generates
+or revises the same strategy JSON consumed by `run_strategy_agent.py`, runs it,
+and uses its metrics and logs to decide whether to inspect, replace, or stop:
 
-After `summaries.filtered.parquet` exists:
-
-```bash
-bash scripts/build_agent_index.sh
+```text
+baseline.py                    fixed prompt -> predictions
+strategy JSON + runner         structured strategy -> predictions
+propose_strategy.py            strategy JSON -> runner -> metrics -> revision
 ```
-
-This builds a local Chroma index under:
-
-- `data/financial-reports-sec/summary/index`
-
-### 10. Run the retrieval agent
-
-Once summaries are generated, cleaned, and indexed:
-
-```bash
-bash scripts/run_retrieval_agent.sh \
-  --provider hf \
-  --model Qwen/Qwen3-8B \
-  --ticker AAPL \
-  --year 2020 \
-  --verbose
-```
-
-The run order is:
-
-1. Generate summaries
-2. Clean summaries
-3. Build the agent index
-4. Run the agent
-
-One agentic run does the following:
-
-- loads the local Chroma index over `summaries.filtered.parquet`
-- builds a task-specific starting prompt for one `(ticker, year)` pair
-- lets the model iterate with search actions, optional sector-peer lookup, and a final stop action
-- enforces a hard date cutoff so the agent cannot query future information beyond the target year
-- when the agent emits `{"action":"final_answer"}`, the environment runs one last prompt over the gathered evidence and returns exactly `UP` or `DOWN`
-
-What you will see on stdout:
-
-- with `--verbose`, each step's JSON action
-- with `--verbose`, the retrieved search results or sector-peer payload for that step
-- the final `UP` or `DOWN` prediction
-- the saved trajectory path
-
-What one run writes to disk:
-
-- `data/financial-reports-sec/summary/agent_trajectory.json` by default
-
-That trajectory file contains:
-
-- target `ticker`
-- target `year`
-- hard stop date
-- starting prompt
-- every tool/action step
-- retrieved evidence
-- final prediction
 
 ## Main Files
 
@@ -362,9 +430,8 @@ That trajectory file contains:
 - `src/data/preprocess_returns.py`
 - `src/data/summarize_risk_sections.py`
 - `src/data/check_sec_effect.py`
-- `src/agent/build_index.py`
-- `src/agent/search.py`
-- `src/agent/run_agent.py`
+- `src/strategy_agent/propose_strategy.py`
+- `src/strategy_agent/run_strategy_agent.py`
+- `src/strategy_agent/strategy.py`
 - `src/eval/run_10k_pnl.py`
-- `strategies/baseline.py`
-- `strategies/util.py`
+- `src/strategies/baseline.py`

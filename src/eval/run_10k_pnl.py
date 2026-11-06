@@ -2,7 +2,7 @@
 """Compute simple 10-K strategy PnL from prediction and return panels.
 
 The script expects Parquet panels with a date index and ticker columns.
-Predictions are loaded from ``predictions/<run_name>.parquet`` by default and
+Predictions are loaded from ``predictions/<run_name>/<run_name>.parquet`` by default and
 returns are loaded from ``data/financial-reports-sec/market_data/return.parquet``.
 
 Workflow:
@@ -57,7 +57,10 @@ def resolve_predictions_path(predictions_dir: Path, run_name: str) -> Path:
     """Resolve the default prediction panel path from the run name."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_name):
         raise ValueError("run name may contain only letters, numbers, '.', '_' and '-'")
-    return predictions_dir / f"{run_name}.parquet"
+    run_dir = predictions_dir / run_name
+    nested_path = run_dir / f"{run_name}.parquet"
+    # Keep existing flat outputs readable while runs migrate to per-run folders.
+    return nested_path if nested_path.exists() else predictions_dir / f"{run_name}.parquet"
 
 
 def load_sector_mapping(path: Path) -> dict[str, list[str]]:
@@ -191,18 +194,27 @@ def t_stat(pnl: pd.Series) -> float:
     return float(math.sqrt(len(values)) * values.mean() / standard_deviation)
 
 
-def plot_gain(gain: pd.Series, run_name: str, output_path: Path) -> None:
+def plot_gain(
+    gain: pd.Series,
+    run_name: str,
+    output_path: Path,
+    always_long_correlation: float | None = None,
+) -> None:
     """Save a cumulative gain plot with Sharpe and t-stat in the legend."""
 
     cumulative = gain.fillna(0.0).cumsum()
     sharpe = annualized_sharpe(gain)
     statistic = t_stat(gain)
     label = f"{run_name} | sharpe={sharpe:.3f} | tstat={statistic:.3f}"
+    title = run_name
+    if always_long_correlation is not None:
+        label += f" | corr(always_long)={always_long_correlation:.3f}"
+        title += f" | corr with always-long={always_long_correlation:.3f}"
 
     figure, axis = plt.subplots(figsize=(11, 6))
     axis.plot(cumulative.index, cumulative, linewidth=2.0, color="#145DA0", label=label)
     axis.axhline(0.0, color="#4B5563", linewidth=0.8)
-    axis.set_title(run_name, loc="left")
+    axis.set_title(title, loc="left")
     axis.set_ylabel("Cumulative gain")
     axis.grid(axis="y", color="#D1D5DB", linewidth=0.7, alpha=0.7)
     axis.spines[["top", "right"]].set_visible(False)
@@ -218,6 +230,15 @@ def plot_gain(gain: pd.Series, run_name: str, output_path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-name", required=True)
+    parser.add_argument(
+        "--artifact-name",
+        help="Optional stem for the output plot and metrics files; defaults to run name",
+    )
+    parser.add_argument(
+        "--always-long",
+        action="store_true",
+        help="Use a constant long position for every available ticker instead of model predictions",
+    )
     parser.add_argument("--predictions-dir", type=Path, default=Path("predictions"))
     parser.add_argument(
         "--returns",
@@ -256,24 +277,54 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    artifact_name = args.artifact_name or args.run_name
     predictions_path = resolve_predictions_path(args.predictions_dir, args.run_name)
-    predictions = pd.read_parquet(predictions_path)
     returns = pd.read_parquet(args.returns)
-    ffill_limit = None if args.ffill_limit is None or args.ffill_limit == 0 else args.ffill_limit
-    predictions, returns = align_panels(predictions, returns, ffill_limit=ffill_limit)
-    sector_mapping = load_sector_mapping(args.sector_mapping) if args.use_sectors else None
-    predictions = apply_postprocess(
-        predictions,
-        args.postprocess,
-        sector_mapping=sector_mapping,
-        normalize_clip=args.normalize_clip,
-    )
     returns = clip_returns(returns, clip=args.clip_returns)
-    pnl = compute_pnl(predictions, returns, lag=args.lag)
+    if args.always_long:
+        pnl = returns.sum(axis=1, skipna=True)
+        always_long_correlation = None
+        output_dir = args.predictions_dir
+        output_stem = "always_long"
+    else:
+        predictions = pd.read_parquet(predictions_path)
+        ffill_limit = None if args.ffill_limit is None or args.ffill_limit == 0 else args.ffill_limit
+        predictions, returns = align_panels(predictions, returns, ffill_limit=ffill_limit)
+        sector_mapping = load_sector_mapping(args.sector_mapping) if args.use_sectors else None
+        predictions = apply_postprocess(
+            predictions,
+            args.postprocess,
+            sector_mapping=sector_mapping,
+            normalize_clip=args.normalize_clip,
+        )
+        pnl = compute_pnl(predictions, returns, lag=args.lag)
+        always_long_pnl = returns.sum(axis=1, skipna=True)
+        always_long_correlation = pnl.corr(always_long_pnl)
+        output_dir = predictions_path.parent
+        output_stem = args.run_name
 
-    plot_path = predictions_path.with_name(f"{args.run_name}_pnl.png")
-    plot_gain(pnl, args.run_name, plot_path)
-    print(f"{annualized_sharpe(pnl):.10f}")
+    plot_path = output_dir / ("always_long.png" if args.always_long else f"{artifact_name}_pnl.png")
+    plot_gain(pnl, artifact_name, plot_path, always_long_correlation=always_long_correlation)
+    sharpe = annualized_sharpe(pnl)
+    statistic = t_stat(pnl)
+    metrics_path = output_dir / f"{artifact_name}_metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "annualized_sharpe": sharpe,
+                "t_stat": statistic,
+                **(
+                    {"always_long_pnl_correlation": float(always_long_correlation)}
+                    if always_long_correlation is not None
+                    else {}
+                ),
+            },
+            indent=2,
+            allow_nan=True,
+        ),
+        encoding="utf-8",
+    )
+    print(f"{sharpe:.10f}")
 
 if __name__ == "__main__":
     main()

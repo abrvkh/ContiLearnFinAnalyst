@@ -6,10 +6,10 @@ The script reads 10-K filings from the local SEC dataset shards, extracts the
 ``section_1A`` for the same issuer via ``--use-past-context``, and asks an LLM
 for a binary market view.
 
-Predictions are saved to ``predictions/<run_name>.parquet`` as a wide panel with
+Predictions are saved to ``predictions/<run_name>/<run_name>.parquet`` as a wide panel with
 filing dates as index, Yahoo tickers as columns, and values in ``{-1, 1}`` or
 ``NaN`` when a model response cannot be parsed. A row-level checkpoint is also
-saved to ``predictions/<run_name>.rows.parquet`` so runs can resume reliably.
+saved to ``predictions/<run_name>/<run_name>.rows.parquet`` so runs can resume reliably.
 
 The strategy can optionally read precomputed risk summaries from
 ``data/financial-reports-sec/summary/summaries.parquet`` instead of raw
@@ -63,7 +63,7 @@ If you maintain a separate Hugging Face-only environment, keep its PyTorch/CUDA
 stack aligned with your local installation.
 
 Use ``--resume`` to continue from existing row-level checkpoints in
-``predictions/<run_name>.rows.parquet`` and skip examples that were already
+``predictions/<run_name>/<run_name>.rows.parquet`` and skip examples that were already
 processed.
 """
 
@@ -71,9 +71,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import concurrent.futures
 import json
 import os
 import re
+import time
+import uuid
+import json
+from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,7 +114,7 @@ Choose exactly one label:
 NEW = the current filing introduces meaningful new risks compared to last year
 NO_NEW = the current filing is mostly the same as last year and any changes are minor or not meaningful
 
-Answer with exactly one label only."""
+Output exactly one final answer in the form `FINAL ANSWER: NEW` or `FINAL ANSWER: NO_NEW`."""
 
 USER_PROMPT_CURRENT_ONLY = """Current year Item 1A Risk Factors:
 {current_risk}
@@ -119,7 +124,7 @@ Choose exactly one label:
 NEW = the filing highlights specific or emerging risks that appear meaningfully new or newly emphasized rather than standard boilerplate
 NO_NEW = the filing appears mostly routine, generic, or standard for a 10-K risk section, without meaningful new risks
 
-Answer with exactly one label."""
+Output exactly one final answer in the form `FINAL ANSWER: NEW` or `FINAL ANSWER: NO_NEW`."""
 
 LABEL_TO_PREDICTION = {
     "NEW": -1,
@@ -291,44 +296,157 @@ def load_backend(provider: str, model: str) -> object:
     raise ValueError(f"unsupported provider: {provider}")
 
 
-def run_openai(client: OpenAI, model: str, prompt: str) -> str:
+def run_openai(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> str:
     """Call the OpenAI Responses API via the official Python SDK."""
 
     response = client.responses.create(
         model=model,
         input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
     )
     return str(response.output_text).strip()
 
 
-def build_hf_prompt(generator: object, system_prompt: str, user_prompt: str) -> str:
+def run_openai_batch(
+    client: OpenAI,
+    model: str,
+    prompts: list[str],
+    system_prompt: str = SYSTEM_PROMPT,
+    poll_seconds: int = 30,
+) -> list[str]:
+    """Run independent Responses API requests through the Batch API."""
+    if not prompts:
+        return []
+    requests = []
+    ids = []
+    for prompt in prompts:
+        custom_id = f"request-{uuid.uuid4().hex}"
+        ids.append(custom_id)
+        requests.append({
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/responses",
+            "body": {
+                "model": model,
+                "input": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+        })
+    payload = "\n".join(json.dumps(item) for item in requests).encode()
+    input_file = client.files.create(file=BytesIO(payload), purpose="batch")
+    batch = client.batches.create(input_file_id=input_file.id, endpoint="/v1/responses", completion_window="24h")
+    while batch.status not in {"completed", "failed", "cancelled", "expired"}:
+        time.sleep(poll_seconds)
+        batch = client.batches.retrieve(batch.id)
+    if batch.status != "completed":
+        raise RuntimeError(f"OpenAI batch {batch.id} ended with status {batch.status}")
+    output = client.files.content(batch.output_file_id).read()
+    by_id: dict[str, str] = {}
+    for line in output.decode().splitlines():
+        item = json.loads(line)
+        if item.get("error"):
+            raise RuntimeError(f"OpenAI batch request {item['custom_id']} failed: {item['error']}")
+        body = item["response"]["body"]
+        text = body.get("output_text")
+        if text is None:
+            text = "".join(
+                part.get("text", "")
+                for out in body.get("output", [])
+                for part in out.get("content", [])
+                if part.get("type") == "output_text"
+            )
+        by_id[item["custom_id"]] = str(text).strip()
+    return [by_id[custom_id] for custom_id in ids]
+
+
+def run_openai_parallel(
+    client: OpenAI,
+    model: str,
+    prompts: list[str],
+    system_prompt: str = SYSTEM_PROMPT,
+    max_workers: int = 32,
+    timeout_seconds: float = 180.0,
+) -> list[str]:
+    """Run independent Responses API requests concurrently with progress."""
+    if not prompts:
+        return []
+    request_client = client.with_options(timeout=timeout_seconds)
+
+    def request(prompt: str) -> str:
+        response = request_client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return str(response.output_text).strip()
+
+    results: list[str | None] = [None] * len(prompts)
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(request, prompt): index for index, prompt in enumerate(prompts)}
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            results[index] = future.result()
+            completed += 1
+            if completed == 1 or completed % 100 == 0 or completed == len(prompts):
+                print(f"OpenAI inference progress: {completed}/{len(prompts)}", flush=True)
+    return [str(result) for result in results]
+
+
+def build_hf_prompt(
+    generator: object,
+    system_prompt: str,
+    user_prompt: str,
+    enable_thinking: bool = False,
+) -> str:
     """Format prompts for Hugging Face models, preferring chat templates when available."""
 
     tokenizer = getattr(generator, "tokenizer", None)
     chat_template = getattr(tokenizer, "chat_template", None) if tokenizer is not None else None
     if tokenizer is not None and chat_template:
-        return str(
-            tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            return str(tokenizer.apply_chat_template(
+                messages,
                 tokenize=False,
                 add_generation_prompt=True,
-            )
-        )
+                enable_thinking=enable_thinking,
+            ))
+        except TypeError:
+            return str(tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            ))
     return f"{system_prompt}\n\n{user_prompt}"
 
 
-def run_hf(generator: object, prompt: str) -> str:
+def run_hf(
+    generator: object,
+    prompt: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    enable_thinking: bool = False,
+    max_new_tokens: int = 512,
+) -> str:
     """Run a local Hugging Face causal LM via transformers."""
 
-    full_prompt = build_hf_prompt(generator, SYSTEM_PROMPT, prompt)
+    full_prompt = build_hf_prompt(generator, system_prompt, prompt, enable_thinking=enable_thinking)
     generation_config = copy.deepcopy(generator.model.generation_config)
-    generation_config.max_new_tokens = 512
+    generation_config.max_new_tokens = max_new_tokens
     generation_config.max_length = None
     result = generator(
         full_prompt,
@@ -340,12 +458,17 @@ def run_hf(generator: object, prompt: str) -> str:
     return str(result[0]["generated_text"]).strip()
 
 
-def run_hf_batch(generator: object, prompts: list[str]) -> list[str]:
+def run_hf_batch(
+    generator: object,
+    prompts: list[str],
+    system_prompt: str = SYSTEM_PROMPT,
+    enable_thinking: bool = False,
+) -> list[str]:
     """Run a local Hugging Face causal LM on a batch of prompts."""
 
-    full_prompts = [build_hf_prompt(generator, SYSTEM_PROMPT, prompt) for prompt in prompts]
+    full_prompts = [build_hf_prompt(generator, system_prompt, prompt, enable_thinking=enable_thinking) for prompt in prompts]
     generation_config = copy.deepcopy(generator.model.generation_config)
-    generation_config.max_new_tokens = 512
+    generation_config.max_new_tokens = 1024
     generation_config.max_length = None
     result = generator(
         full_prompts,
@@ -364,14 +487,32 @@ def run_hf_batch(generator: object, prompts: list[str]) -> list[str]:
     return outputs
 
 
-def run_vllm(generator: object, prompt: str) -> str:
+def run_vllm(
+    generator: object,
+    prompt: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    enable_thinking: bool = False,
+    max_tokens: int = 1024,
+) -> str:
     """Run a local vLLM model for one prompt."""
 
-    outputs = run_vllm_batch(generator, [prompt])
+    outputs = run_vllm_batch(
+        generator,
+        [prompt],
+        system_prompt=system_prompt,
+        enable_thinking=enable_thinking,
+        max_tokens=max_tokens,
+    )
     return outputs[0] if outputs else ""
 
 
-def run_vllm_batch(generator: object, prompts: list[str]) -> list[str]:
+def run_vllm_batch(
+    generator: object,
+    prompts: list[str],
+    system_prompt: str = SYSTEM_PROMPT,
+    enable_thinking: bool = False,
+    max_tokens: int = 1024,
+) -> list[str]:
     """Run a local vLLM model on a batch of prompts."""
 
     try:
@@ -379,10 +520,10 @@ def run_vllm_batch(generator: object, prompts: list[str]) -> list[str]:
     except ImportError as exc:
         raise RuntimeError("vllm is required for provider=vllm") from exc
 
-    full_prompts = [build_hf_prompt(generator, SYSTEM_PROMPT, prompt) for prompt in prompts]
+    full_prompts = [build_hf_prompt(generator, system_prompt, prompt, enable_thinking=enable_thinking) for prompt in prompts]
     sampling_params = SamplingParams(
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=max_tokens,
     )
     results = generator.generate(full_prompts, sampling_params)
     outputs: list[str] = []
@@ -407,38 +548,17 @@ def normalize_label_token(token: str) -> str:
 
 
 def extract_explicit_label(text: str) -> str | None:
-    """Recover the model's intended label from noisy completions."""
+    """Extract labels only from explicit answer markers."""
 
-    patterns = (
-        re.compile(r"\\BOXED\{\s*(NO(?:\\_|[\s\-_])?NEW|NEW)\s*\}", flags=re.IGNORECASE),
-        re.compile(
-            r"(?:^|\n)\s*(?:ANSWER|FINAL ANSWER|LABEL|PREDICTION)\s*:\s*(NO(?:\\_|[\s\-_])?NEW|NEW)\b",
-            flags=re.IGNORECASE,
-        ),
-        re.compile(
-            r"(?:^|\n)\s*(NO(?:\\_|[\s\-_])?NEW|NEW)\s*(?:$|\n)",
-            flags=re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:THE ANSWER IS|THE LABEL IS|THE CORRECT LABEL IS|THE APPROPRIATE LABEL IS|"
-            r"THE LABEL SHOULD BE|THE CORRECT LABEL SHOULD BE|THE APPROPRIATE LABEL SHOULD BE)\s*"
-            r"(?:[:\-]\s*)?[\"']?(NO(?:\\_|[\s\-_])?NEW|NEW)\b",
-            flags=re.IGNORECASE,
-        ),
+    pattern = re.compile(
+        r"(?:FINAL\s+ANSWER|ANSWER)\s*(?::|\s+IS)\s*"
+        r"[\"']?(NO(?:\\_|[\s\-_])?NEW|NEW)\b",
+        flags=re.IGNORECASE,
     )
-    matches: list[tuple[int, str]] = []
-    for pattern_index, pattern in enumerate(patterns):
-        for match in pattern.finditer(text):
-            token = normalize_label_token(str(match.group(1)))
-            line_start = text.rfind("\n", 0, match.start()) + 1
-            line_prefix = text[line_start:match.start()].upper()
-            if pattern_index != 0 and ("FORMAT" in line_prefix or "EXACTLY ONE LABEL" in line_prefix):
-                continue
-            matches.append((match.start(), token))
-    if not matches:
+    matches = [normalize_label_token(str(match.group(1))) for match in pattern.finditer(text)]
+    if not matches or len(set(matches)) > 1:
         return None
-    matches.sort(key=lambda item: item[0])
-    return matches[0][1]
+    return matches[0]
 
 
 def to_prediction(text: str) -> int:
@@ -454,12 +574,6 @@ def to_prediction(text: str) -> int:
     if explicit_label is not None:
         return LABEL_TO_PREDICTION[explicit_label]
 
-    labels = [normalize_label_token(match) for match in re.findall(r"\b(NO(?:[\s\-_])?NEW|NEW)\b", upper)]
-    unique_labels = set(labels)
-    if len(unique_labels) == 1 and labels:
-        if "FORMAT" in upper or "EXACTLY ONE LABEL" in upper:
-            raise ValueError(f"model echoed formatting instructions instead of answering: {text!r}")
-        return LABEL_TO_PREDICTION[labels[0]]
     raise ValueError(f"could not parse model output as risk-change label: {text!r}")
 
 
@@ -736,7 +850,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--summaries-path",
         type=Path,
-        help="Optional normalized summary parquet to use instead of raw section_1A text",
+        default=Path("data/financial-reports-sec/summary/summaries.filtered.parquet"),
+        help="Normalized cleaned risk-summary parquet to use for the run",
     )
     parser.add_argument("--splits", nargs="+", default=("train", "test"))
     parser.add_argument("--tickers", nargs="+", help="Optional Yahoo tickers to restrict the run to")
@@ -758,6 +873,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_prediction_paths(predictions_dir: Path, run_name: str) -> tuple[Path, Path]:
+    """Return the run-specific directory and its panel/checkpoint paths."""
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_name):
+        raise ValueError("run name may contain only letters, numbers, '.', '_' and '-'")
+    run_dir = predictions_dir / run_name
+    return run_dir / f"{run_name}.parquet", run_dir / f"{run_name}.rows.parquet"
+
+
 def main() -> None:
     args = parse_args()
     tickers_filter = {ticker.upper() for ticker in args.tickers} if args.tickers else None
@@ -775,15 +899,10 @@ def main() -> None:
         flush=True,
     )
     print("Loading filing examples...", flush=True)
-    if args.summaries_path is not None:
-        print(f"Using summaries from {args.summaries_path}", flush=True)
-        examples = load_summary_examples(args.summaries_path, tuple(args.splits), tickers_filter=tickers_filter)
-    else:
-        examples = load_examples(args.dataset_dir, tuple(args.splits), tickers_filter=tickers_filter)
+    print(f"Using cleaned summaries from {args.summaries_path}", flush=True)
+    examples = load_summary_examples(args.summaries_path, tuple(args.splits), tickers_filter=tickers_filter)
     print(f"Loaded {len(examples)} filing examples", flush=True)
-    args.predictions_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.predictions_dir / f"{args.run_name}.parquet"
-    rows_output_path = args.predictions_dir / f"{args.run_name}.rows.parquet"
+    output_path, rows_output_path = resolve_prediction_paths(args.predictions_dir, args.run_name)
     panel = build_prediction_panel(
         args.provider,
         args.model,

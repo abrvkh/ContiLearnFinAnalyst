@@ -427,6 +427,9 @@ def download_market_data(
 def build_return_panel(
     universe: Sequence[Mapping[str, Any]],
     prices_dir: Path,
+    *,
+    max_bad_fraction: float = 0.01,
+    max_return: float = 10.0,
 ) -> Any:
     """Build a date-by-ticker panel of total returns on a shared calendar.
 
@@ -451,14 +454,17 @@ def build_return_panel(
             continue
         try:
             history = pd.read_csv(path)
-            if "date" not in history.columns or "adj_close" not in history.columns:
-                raise ValueError("expected date and adj_close columns")
-            dates = pd.to_datetime(history["date"], errors="raise", utc=True).dt.tz_localize(None)
-            adjusted_close = pd.to_numeric(history["adj_close"], errors="coerce")
-            prices = pd.Series(adjusted_close.to_numpy(), index=dates, name=ticker)
-            if prices.index.has_duplicates:
-                raise ValueError("duplicate dates")
-            prices = prices.sort_index()
+            prices, bad_fraction = clean_prices(
+                history,
+                max_return=max_return,
+            )
+            if bad_fraction > max_bad_fraction:
+                print(
+                    f"Returns skipped for {ticker}: {bad_fraction:.2%} invalid observations",
+                    flush=True,
+                )
+                continue
+            prices.name = ticker
             adjusted_prices.append(prices)
         except Exception as exc:
             print(f"Returns skipped for {ticker}: {type(exc).__name__}: {exc}", flush=True)
@@ -472,6 +478,62 @@ def build_return_panel(
     returns = price_panel.pct_change(fill_method=None).dropna(how="all")
     returns.index.name = "date"
     return returns
+
+
+def clean_prices(
+    history: Any,
+    *,
+    max_return: float = 10.0,
+) -> tuple[Any, float]:
+    """Return a defensively cleaned adjusted-price series and bad-row fraction.
+
+    Yahoo's ``adj_close`` already incorporates splits and dividends.  We retain
+    it when it is sane, but validate it against the raw close and split column.
+    A split changes the quoted price, not the investor's wealth: a 2-for-1
+    split halves the raw price while doubling the share count.  The adjusted
+    series therefore must not show a return on the split date.  We use the
+    reported split ratio when validating raw prices and reject observations
+    whose adjusted or split-adjusted move is impossible/suspicious.
+
+    Invalid rows are set to NaN; callers can exclude tickers with too many such
+    rows.  The row after a bad price is also invalid because its return would
+    otherwise be contaminated by that price.
+    """
+
+    import numpy as np  # type: ignore
+    import pandas as pd  # type: ignore
+
+    required = {"date", "close", "adj_close"}
+    missing = required.difference(history.columns)
+    if missing:
+        raise ValueError(f"expected price columns missing: {sorted(missing)}")
+
+    frame = history.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="raise", utc=True).dt.tz_localize(None)
+    frame = frame.sort_values("date")
+    if frame["date"].duplicated().any():
+        raise ValueError("duplicate dates")
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    adjusted = pd.to_numeric(frame["adj_close"], errors="coerce")
+    split_values = frame["stock_splits"] if "stock_splits" in frame.columns else pd.Series(0.0, index=frame.index)
+    splits = pd.to_numeric(split_values, errors="coerce").fillna(0.0)
+    split_factor = splits.where(splits > 0, 1.0)
+
+    valid = np.isfinite(close) & (close > 0) & np.isfinite(adjusted) & (adjusted > 0)
+    adjusted_return = adjusted.pct_change(fill_method=None)
+    # Yahoo reports a 2-for-1 split as 2.0.  The post-split quote is roughly
+    # half the old quote, so multiply the observed price ratio by the split
+    # factor to remove the mechanical price change.
+    raw_return = close.div(close.shift(1)).mul(split_factor).sub(1.0)
+    valid &= adjusted_return.ge(-1.0) & adjusted_return.le(max_return)
+    valid &= raw_return.ge(-1.0) & raw_return.le(max_return)
+
+    # A bad price contaminates both the jump into that row and the jump out.
+    bad_price = ~valid
+    valid &= ~bad_price.shift(-1, fill_value=False)
+    cleaned = pd.Series(adjusted.where(valid).to_numpy(), index=frame["date"], name="adj_close")
+    bad_fraction = float((~valid).mean())
+    return cleaned, bad_fraction
 
 
 def save_return_panel(returns: Any, path: Path) -> None:
@@ -546,6 +608,13 @@ def main() -> None:
     write_csv(normalized, args.output_dir / "equity_metadata.csv", metadata_fields)
     sector_companies = build_sector_company_mapping(normalized)
     sector_path = args.output_dir / "sector_companies.json"
+    if not sector_companies and sector_path.exists():
+        previous_sector_companies = json.loads(sector_path.read_text(encoding="utf-8"))
+        if previous_sector_companies:
+            raise RuntimeError(
+                "metadata refresh produced no sector classifications; refusing to "
+                f"replace existing mapping at {sector_path}"
+            )
     temporary = sector_path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(sector_companies, handle, indent=2, sort_keys=True)

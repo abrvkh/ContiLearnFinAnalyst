@@ -1,6 +1,7 @@
 # Data and generated artifacts
 /data/
 predictions/
+results/
 .tmp/
 
 # Python environment and build outputs
@@ -23,6 +24,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
+
+# Experimental/local agent implementations
+/src/search_agent/
+/src/contilearn/
 
 # Jupyter
 .ipynb_checkpoints/

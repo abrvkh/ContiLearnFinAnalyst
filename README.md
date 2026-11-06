@@ -163,7 +163,7 @@ uv run python src/strategies/baseline.py \
 
 This writes:
 
-- `predictions/baseline_strategy.parquet`
+- `predictions/baseline_strategy/baseline_strategy.parquet`
 
 You can override the output name with `--run-name`.
 
@@ -199,7 +199,7 @@ uv run python src/eval/run_10k_pnl.py --run-name baseline_strategy
 
 This:
 
-- loads `predictions/baseline_strategy.parquet`
+- loads `predictions/baseline_strategy/baseline_strategy.parquet`
 - loads `data/financial-reports-sec/market_data/return.parquet`
 - aligns dates and tickers
 - computes `pred.shift(2).mul(ret).sum(axis=1)`
@@ -228,40 +228,32 @@ Two evaluation configurations that currently produce nontrivial results are:
 uv run python src/eval/run_10k_pnl.py \
   --run-name baseline_strategy \
   --ffill-limit 30 \
-  --clip-returns 1.0
 ```
 
-Observed annualized Sharpe on the current local run: about `0.5363`.
+Observed annualized Sharpe on the current local run: about `0.669`.
 
-This is the simplest decent baseline in the current setup because it uses only:
+This is the simplest decent baseline in the current setup because it uses only forward-filled filing signals without adding cross-sectional or sector-relative transformations.
 
-- forward-filled filing signals
-- clipped realized returns
-
-without adding cross-sectional or sector-relative transformations.
-
+With per-date z-scoring (signal - cross_sectional_mean) / cross_sectional_std: 
 ```bash
 uv run python src/eval/run_10k_pnl.py \
   --run-name baseline_strategy \
   --ffill-limit 30 \
   --postprocess cross-sectional-rank \
-  --clip-returns 1.0 \
   --postprocess normalize-predictor
 ```
+gets an annualized Sharpe on the current local run: about `0.663`.
 
-Observed annualized Sharpe on the current local run: about `0.5270`.
-
+With per-date, over sector only z-scoring gets: 
 ```bash
 uv run python src/eval/run_10k_pnl.py \
   --run-name baseline_strategy \
   --ffill-limit 252 \
   --postprocess cross-sectional-rank \
   --use-sectors \
-  --clip-returns 1.0 \
   --postprocess normalize-predictor
 ```
-
-Observed annualized Sharpe on the current local run: about `0.8912`.
+gets an annualized Sharpe on the current local run: about `1.16`.
 
 When reproducing these results, make sure the predictions were generated from `summaries.filtered.parquet`, not from the raw filings directly.
 
